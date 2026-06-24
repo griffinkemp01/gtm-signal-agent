@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -50,6 +51,12 @@ CACHE_PATH = Path.home() / ".signal_agent" / "domain_cache.json"
 RESOLVE_CONCURRENCY = 3   # conservative — Anthropic rate-limits aggressively on cheap tiers
 RESOLVE_MAX_RETRIES = 5
 NAME_COLUMN_CANDIDATES = ("Company", "Name", "Company Name", "company_name", "company", "name")
+DOMAIN_COLUMN_CANDIDATES = (
+    "Domain", "domain", "Company Domain", "Website", "website", "URL", "url",
+)
+SIZE_COLUMN_CANDIDATES = (
+    "Size", "size", "Employees", "Employee Count", "Company Size", "Headcount",
+)
 
 SYSTEM_PROMPT = """\
 You resolve US/global company names to their primary corporate web domain.
@@ -78,6 +85,10 @@ class ResolvedCompany:
     confidence: float
     ambiguous: bool
     notes: str
+    # Per-company segment/tier derived from the CSV Size column. None → fall
+    # back to the CLI --segment / --tier defaults at upsert time.
+    segment: str | None = None
+    tier: int | None = None
 
 
 def _load_cache() -> dict[str, dict]:
@@ -94,22 +105,73 @@ def _save_cache(cache: dict[str, dict]) -> None:
     CACHE_PATH.write_text(json.dumps(cache, indent=2, sort_keys=True))
 
 
-def _read_names(csv_path: Path) -> list[str]:
-    """Extract the Company column from the CSV, handling BOM + quoted rows."""
+def _normalize_domain(raw: str) -> str | None:
+    """Strip protocol / www / path so 'https://www.acme.com/jobs' → 'acme.com'."""
+    d = (raw or "").strip().lower()
+    if not d:
+        return None
+    for prefix in ("https://", "http://"):
+        if d.startswith(prefix):
+            d = d[len(prefix):]
+    if d.startswith("www."):
+        d = d[4:]
+    d = d.split("/")[0].strip()
+    return d or None
+
+
+def _segment_tier_from_size(raw: str) -> tuple[str | None, int | None]:
+    """Map an employee-count Size string to ICP segment + tier (docs/icp.md).
+
+    Uses the LOWER bound of the range so we don't over-promote: a "1,001-5,000"
+    bucket lands in B, not A.
+      lower >= 5000  → Segment A / tier 1   (large regulated enterprise)
+      lower >= 1000  → Segment B / tier 2   (mid-market scaling AI)
+      else           → Segment C / tier 3   (sub-1,000)
+    Returns (None, None) when the size is blank/unparseable → caller defaults.
+    """
+    nums = [int(n.replace(",", "")) for n in re.findall(r"[\d,]+", raw or "")]
+    if not nums:
+        return (None, None)
+    lower = min(nums)
+    if lower >= 5000:
+        return ("A", 1)
+    if lower >= 1000:
+        return ("B", 2)
+    return ("C", 3)
+
+
+def _read_rows(csv_path: Path) -> list[tuple[str, str | None, str | None, int | None]]:
+    """Return (name, domain|None, segment|None, tier|None) from the CSV.
+
+    Uses the CSV's domain column when present so we DON'T pay Claude to
+    re-resolve domains we already have — only rows with a blank/missing domain
+    fall back to LLM resolution. Segment/tier are derived from the Size column
+    when available (None → caller's --segment/--tier defaults).
+    """
     with csv_path.open(encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
-        name_col = next(
-            (c for c in NAME_COLUMN_CANDIDATES if c in reader.fieldnames), None
-        )
+        fields = reader.fieldnames or []
+        name_col = next((c for c in NAME_COLUMN_CANDIDATES if c in fields), None)
+        domain_col = next((c for c in DOMAIN_COLUMN_CANDIDATES if c in fields), None)
+        size_col = next((c for c in SIZE_COLUMN_CANDIDATES if c in fields), None)
         if name_col is None:
             # Fallback: single-column CSV with no proper header.
             f.seek(0)
             rows = [row[0].strip() for row in csv.reader(f) if row and row[0].strip()]
-            # Skip the header if it looks like one.
             if rows and rows[0].lower() in {c.lower() for c in NAME_COLUMN_CANDIDATES}:
                 rows = rows[1:]
-            return [r for r in rows if r]
-        return [row[name_col].strip() for row in reader if row.get(name_col, "").strip()]
+            return [(r, None, None, None) for r in rows if r]
+        out: list[tuple[str, str | None, str | None, int | None]] = []
+        for row in reader:
+            name = (row.get(name_col) or "").strip()
+            if not name:
+                continue
+            domain = _normalize_domain(row.get(domain_col, "")) if domain_col else None
+            segment, tier = (
+                _segment_tier_from_size(row.get(size_col, "")) if size_col else (None, None)
+            )
+            out.append((name, domain, segment, tier))
+        return out
 
 
 def _resolve_one(client: Anthropic, name: str, cache: dict[str, dict]) -> ResolvedCompany:
@@ -220,6 +282,11 @@ def upsert_companies(resolved: list[ResolvedCompany], default_tier: int,
                 domain_value = r.domain
                 is_icp = True
 
+            # Per-row segment/tier (derived from CSV Size) win; fall back to the
+            # CLI defaults when the row didn't carry one.
+            row_segment = r.segment or default_segment
+            row_tier = r.tier or default_tier
+
             existing = s.execute(
                 select(Company).where(Company.domain == domain_value)
             ).scalar_one_or_none()
@@ -229,8 +296,8 @@ def upsert_companies(resolved: list[ResolvedCompany], default_tier: int,
                     s.add(Company(
                         domain=domain_value,
                         name=r.name,
-                        segment=default_segment,
-                        target_tier=default_tier,
+                        segment=row_segment,
+                        target_tier=row_tier,
                         is_icp=is_icp,
                     ))
                 inserted += 1
@@ -243,9 +310,9 @@ def upsert_companies(resolved: list[ResolvedCompany], default_tier: int,
                 # update or editing the drop out of whatever list excluded it.
                 if not dry_run:
                     if existing.target_tier is None:
-                        existing.target_tier = default_tier
+                        existing.target_tier = row_tier
                     if not existing.segment:
-                        existing.segment = default_segment
+                        existing.segment = row_segment
                 updated += 1
 
     return {
@@ -274,16 +341,41 @@ def main() -> int:
         print(f"✗ CSV not found: {args.csv_path}", file=sys.stderr)
         return 1
 
-    names = _read_names(args.csv_path)
-    print(f"=== Import {args.csv_path.name}: {len(names)} companies ===\n")
-    print(f"[resolve] name → domain via Claude (cached, concurrent × {RESOLVE_CONCURRENCY})...\n")
+    rows = _read_rows(args.csv_path)
+    print(f"=== Import {args.csv_path.name}: {len(rows)} companies ===\n")
 
-    if args.skip_resolve:
-        resolved = [ResolvedCompany(name=n, domain=None, confidence=0.0,
-                                    ambiguous=False, notes="--skip-resolve")
-                    for n in names]
-    else:
-        resolved = resolve_all(names)
+    # Trust domains already in the CSV (confidence 1.0, no Claude call). Only
+    # rows with a blank/missing domain need LLM resolution. Segment/tier are
+    # carried from the CSV Size column (None → CLI --segment/--tier defaults).
+    from_csv = [(n, d, seg, tier) for n, d, seg, tier in rows if d]
+    need_resolve = [n for n, d, _seg, _tier in rows if not d]
+
+    resolved: list[ResolvedCompany] = [
+        ResolvedCompany(name=n, domain=d, confidence=1.0, ambiguous=False,
+                        notes="from csv", segment=seg, tier=tier)
+        for n, d, seg, tier in from_csv
+    ]
+    print(f"[csv] {len(from_csv)} domains taken from the CSV; "
+          f"{len(need_resolve)} need resolution")
+
+    # Segment/tier distribution derived from the Size column.
+    seg_dist: dict[str, int] = {}
+    for r in resolved:
+        seg_dist[r.segment or f"default({args.segment})"] = (
+            seg_dist.get(r.segment or f"default({args.segment})", 0) + 1
+        )
+    print(f"[segment] derived from Size: "
+          + "  ".join(f"{k}={v}" for k, v in sorted(seg_dist.items())))
+
+    if need_resolve:
+        if args.skip_resolve:
+            resolved += [ResolvedCompany(name=n, domain=None, confidence=0.0,
+                                         ambiguous=False, notes="--skip-resolve")
+                         for n in need_resolve]
+        else:
+            print(f"\n[resolve] {len(need_resolve)} missing domains → Claude "
+                  f"(cached, concurrent × {RESOLVE_CONCURRENCY})...\n")
+            resolved += resolve_all(need_resolve)
 
     counts_by_tier = {"high": 0, "low": 0, "missing": 0}
     for r in resolved:

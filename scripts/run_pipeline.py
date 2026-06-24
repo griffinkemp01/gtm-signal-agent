@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 # Initialize Arthur tracing BEFORE importing any module that uses Anthropic
 # or httpx — the instrumentors wrap those libraries at import time.
 from signal_agent.observability import tracing as _tracing
+
 _tracing.initialize()
 
 import structlog  # noqa: E402
@@ -26,12 +27,16 @@ from signal_agent.config import settings  # noqa: E402
 from signal_agent.db import session_scope  # noqa: E402
 from signal_agent.ingestors.base import CompanyTarget  # noqa: E402
 from signal_agent.ingestors.registry import enabled_ingestors  # noqa: E402
-from signal_agent.integrations.hubspot import HubSpotClient  # noqa: E402
+from signal_agent.integrations.clay import ClayAccountPayload, ClayPusher  # noqa: E402
+from signal_agent.integrations.hubspot import HubSpotClient, company_record_url  # noqa: E402
 from signal_agent.integrations.slack import AlertContext, SlackAlerter  # noqa: E402
 from signal_agent.models import Alert, Company, Signal, SignalStatus  # noqa: E402
 from signal_agent.observability.tracing import stage_span  # noqa: E402
 from signal_agent.quality import (  # noqa: E402
-    circuit_breaker, competitor_customers, digest, suppression,
+    circuit_breaker,
+    competitor_customers,
+    digest,
+    suppression,
 )
 from signal_agent.schemas import NormalizedSignal  # noqa: E402
 from signal_agent.scoring import scorer  # noqa: E402
@@ -80,7 +85,7 @@ async def ingest_company(target: CompanyTarget) -> list[int]:
                     status=SignalStatus.PENDING.value,
                 ).on_conflict_do_update(
                     constraint="uq_signal_dedup",
-                    set_={"last_seen_at": datetime.now(timezone.utc)},
+                    set_={"last_seen_at": datetime.now(UTC)},
                 ).returning(Signal.id, Signal.status)
                 row = s.execute(stmt).first()
                 if row is None:
@@ -206,10 +211,55 @@ def _process_signal_inner(
             "delta_vs_last": decision.delta_vs_last,
         }
 
+        # Contributing-signal context — built once here, reused by the Clay
+        # push (below) and the Slack alert (further down).
+        recent = (
+            s.query(Signal)
+            .filter(Signal.id.in_(rollup.contributing_signal_ids))
+            .order_by(Signal.detected_at.desc())
+            .limit(3)
+            .all()
+        )
+        top_signals = [
+            {"type": r.signal_type, "url": r.source_url,
+             "text": r.signal_text.split("\n", 1)[0][:120]}
+            for r in recent
+        ]
+
+        # 3a. Outbound last-mile — DECOUPLED from Slack alerting. Pushes the
+        # account to Clay on a wider, lower bar (CLAY_PUSH_SCORE_THRESHOLD) with
+        # its own cooldown, so qualified-but-not-alert-worthy accounts still
+        # feed contact discovery + sequencing. Runs regardless of the Slack
+        # alert decision below. No-op when CLAY_WEBHOOK_URL is unset.
+        clay_decision = scorer.should_push_to_clay(rollup, sig, sig.company)
+        clay_outcome = clay_decision.reason
+        if clay_decision.should_push:
+            with stage_span("clay_push") as clay_span:
+                pushed = ClayPusher().push(ClayAccountPayload(
+                    company_name=sig.company.name,
+                    company_domain=sig.company.domain,
+                    hubspot_id=sig.company.hubspot_id,
+                    target_tier=sig.company.target_tier,
+                    segment=sig.company.segment,
+                    cumulative_score=rollup.cumulative_score,
+                    tier=rollup.top_tier,
+                    signal_summary=sig.llm_summary or "",
+                    triggering_signal={"type": sig.signal_type, "url": sig.source_url,
+                                       "text": sig.signal_text.split("\n", 1)[0][:120]},
+                    top_signals=top_signals,
+                    qualification_reason=clay_decision.reason,
+                    also_alerted=decision.should_fire,
+                ))
+                clay_span.set_attribute("signal_agent.clay_pushed", pushed)
+            if pushed:
+                scorer.mark_clay_pushed(sig.company, rollup.cumulative_score)
+            clay_outcome = "pushed" if pushed else f"not_pushed_{clay_decision.reason}"
+
         if not decision.should_fire:
             return {
                 "signal_id": signal_id,
                 "outcome": f"suppressed_{decision.reason}",
+                "clay": clay_outcome,
                 **score_info,
             }
 
@@ -236,7 +286,7 @@ def _process_signal_inner(
             return {"signal_id": signal_id, "outcome": "alert_skipped_circuit_breaker"}
 
         # 6. Snooze check
-        if sig.company.snoozed_until and sig.company.snoozed_until > datetime.now(timezone.utc):
+        if sig.company.snoozed_until and sig.company.snoozed_until > datetime.now(UTC):
             return {"signal_id": signal_id, "outcome": "alert_skipped_snoozed"}
 
         # 7. Fire alert (always persist Alert row for audit/metrics)
@@ -259,7 +309,10 @@ def _process_signal_inner(
         if per_run_alerted_companies is not None:
             per_run_alerted_companies.add(sig.company_id)
 
-        # 7a. Digest-mode gating — bursty non-Tier-1 alerts get batched.
+        # (top_signals + the Clay push were handled in step 3a above — the Clay
+        # push is decoupled from alerting and already fired for this account.)
+
+        # 7b. Digest-mode gating — bursty non-Tier-1 alerts get batched.
         if digest.should_batch(s, sig.tier):
             digest.enqueue(s, alert)
             return {
@@ -269,22 +322,7 @@ def _process_signal_inner(
                 **score_info,
             }
 
-        recent = (
-            s.query(Signal)
-            .filter(Signal.id.in_(rollup.contributing_signal_ids))
-            .order_by(Signal.detected_at.desc())
-            .limit(3)
-            .all()
-        )
-        top_signals = [
-            {"type": r.signal_type, "url": r.source_url,
-             "text": r.signal_text.split("\n", 1)[0][:120]}
-            for r in recent
-        ]
-        hubspot_url = (
-            f"https://app.hubspot.com/contacts/_/company/{sig.company.hubspot_id}"
-            if sig.company.hubspot_id else None
-        )
+        hubspot_url = company_record_url(sig.company.hubspot_id)
         ctx = AlertContext(
             company_name=sig.company.name,
             company_domain=sig.company.domain,
@@ -311,7 +349,7 @@ def _process_signal_inner(
                     score=rollup.cumulative_score,
                     tier=rollup.top_tier,
                     summary=sig.llm_summary or "",
-                    last_signal_date_iso=sig.detected_at.astimezone(timezone.utc).isoformat(),
+                    last_signal_date_iso=sig.detected_at.astimezone(UTC).isoformat(),
                 )
 
         return {

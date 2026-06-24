@@ -5,6 +5,18 @@ and what signals indicate they're entering the buying window.** Every ingestor
 keyword set, the LLM validator prompt, the scoring rubric weights, and the seed
 target-account list in this repo derive from this doc.
 
+> **Regulatory update (April 17, 2026 — OCC Bulletin 2026-13, interagency MRM
+> rewrite):** Generative AI and agentic AI are now explicitly OUT of SR 11-7 /
+> OCC 2011-12 scope, with an RFI to follow. Messaging and the validator's
+> `summary_for_ae` must NOT claim SR 11-7 governs a prospect's GenAI/agentic
+> systems. Current pegs for those systems: fair lending (Reg B, FCRA), NYDFS
+> Part 500, FFIEC third-party risk, SEC AI-disclosure scrutiny, state laws
+> (Colorado AI Act, CA DFPI), and the forthcoming RFI. SR 11-7 still applies to
+> traditional quantitative models (credit-scoring regressions, VaR, PD) only.
+> SR 11-7 stays in the ingestor keyword lists as a *detection* term (it still
+> flags a model-risk-aware buyer); it is just no longer the governance frame we
+> assert for GenAI.
+
 When this doc changes, update:
 - `signal_agent/ingestors/keywords.py` — job posting classifier keywords
 - `signal_agent/ingestors/news.py` — news keyword groups

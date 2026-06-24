@@ -75,6 +75,12 @@ class Company(Base):
     # Used by should_alert() to suppress re-alerts unless a material change fires.
     last_alerted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     last_alerted_score: Mapped[float | None] = mapped_column(Float)
+    # Clay outbound push tracking. Decoupled from Slack alerting: an account can
+    # be pushed to the outbound last-mile (lower bar) without ever firing a
+    # Slack alert. Own cooldown so we don't re-enroll an account's contacts on
+    # every pipeline run. Orthogonal to last_alerted_at / last_alerted_score.
+    last_clay_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_clay_pushed_score: Mapped[float | None] = mapped_column(Float)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     signals: Mapped[list["Signal"]] = relationship(back_populates="company")

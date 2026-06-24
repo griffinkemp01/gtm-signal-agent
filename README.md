@@ -40,6 +40,10 @@ from it.
    `arthur_signal_summary`, `arthur_last_signal_date` on the company record.
 9. **Traces everything** via OpenTelemetry to the Arthur GenAI Engine
    (prompt, completion, tokens, latency per LLM call + pipeline spans per stage).
+10. **Pushes qualified accounts to Clay** for the outbound last mile — contact
+    discovery (Head of AI / VP Data Science / CISO), email verification, a
+    signal-keyed opener, and HubSpot Sequence enrollment. No-op unless
+    `CLAY_WEBHOOK_URL` is set. See [docs/clay-last-mile.md](docs/clay-last-mile.md).
 
 ## Repo layout
 

@@ -106,6 +106,23 @@ NEGATIVE signals (mark is_valid=false):
  - Companies <500 employees with no AI-native product (fails ICP)
  - Fully committed to a competing platform with no switching signal
 
+REGULATORY CURRENCY (as of the April 17, 2026 interagency MRM rewrite,
+OCC Bulletin 2026-13) — this is load-bearing for summary_for_ae:
+ - Generative AI and agentic AI were explicitly carved OUT of SR 11-7 /
+   OCC 2011-12 scope. Do NOT write a summary_for_ae claiming SR 11-7 governs a
+   company's GenAI or agentic systems. That framing is now wrong and makes
+   Arthur look behind the news to a model-risk audience.
+ - For GenAI / agentic signals at US financial institutions, the live
+   governance pegs are fair lending (Reg B, FCRA), NYDFS Part 500, FFIEC
+   third-party risk, SEC AI-disclosure scrutiny, and state laws (Colorado AI
+   Act, CA DFPI), plus the forthcoming RFI that will define the next framework.
+ - SR 11-7 / OCC 2011-12 remain valid ONLY for traditional quantitative models
+   (credit-scoring regressions, VaR, PD). Reference them in a summary only when
+   the signal is about classic models, never about agents or LLMs.
+ - You may still record "SR 11-7" in extracted.regulatory_mentioned when the
+   source text itself names it; just don't assert it as the governing frame for
+   GenAI in summary_for_ae.
+
 Respond with ONLY a JSON object:
 {
   "is_valid": boolean,
@@ -113,7 +130,8 @@ Respond with ONLY a JSON object:
   "reasoning": string, 1-2 sentences citing which Arthur ICP criterion applies,
   "summary_for_ae": string, ONE sentence describing why this matters for Arthur's
      pitch (reference the specific capability: discovery, guardrails, evals,
-     tracing, access policy, or compliance framework),
+     tracing, access policy, or a CURRENT compliance framework per the
+     REGULATORY CURRENCY note above — never SR 11-7 for GenAI/agentic systems),
   "extracted": {
     "role_title": string or null,
     "seniority": string or null,          // "ic" | "manager" | "director" | "vp" | "c_level"

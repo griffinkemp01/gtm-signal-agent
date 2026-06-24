@@ -34,6 +34,25 @@ from signal_agent.config import settings
 log = structlog.get_logger()
 
 
+def company_record_url(hubspot_id: str | None) -> str | None:
+    """Build a clickable HubSpot company-record URL.
+
+    Uses the portal id + the modern object-record path (`/record/0-2/<id>`,
+    where `0-2` is the company object type). Falls back to the legacy
+    `_`-placeholder form only when HUBSPOT_PORTAL_ID is unset — that form relies
+    on HubSpot redirecting to the logged-in portal and 404s in practice, so set
+    the portal id in .env.
+    """
+    if not hubspot_id:
+        return None
+    if settings.hubspot_portal_id:
+        return (
+            f"https://app.hubspot.com/contacts/"
+            f"{settings.hubspot_portal_id}/record/0-2/{hubspot_id}"
+        )
+    return f"https://app.hubspot.com/contacts/_/company/{hubspot_id}"
+
+
 @dataclass
 class HubSpotCompany:
     id: str

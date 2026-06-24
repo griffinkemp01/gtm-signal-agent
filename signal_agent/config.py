@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     env: str = "dev"
 
+    # Ingestion — comma-separated ingestor `source` names to SKIP (e.g.
+    # "competitive,conference"). Useful to drop sources that rate-limit or add
+    # little value at scale. `competitive` hits Reddit, which 429s aggressively
+    # on unauthenticated search across a large account list.
+    disabled_ingestors: str = ""
+
     # Anthropic
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-5-20250929"
@@ -39,12 +45,32 @@ class Settings(BaseSettings):
     hubspot_access_token: str = ""
     hubspot_timeline_app_id: str = ""
     hubspot_timeline_event_template_id: str = ""
+    # Portal (hub) id — needed to build working company-record URLs. Without it
+    # we fall back to the legacy `_`-placeholder URL, which HubSpot no longer
+    # reliably resolves (the "Open in HubSpot" link 404s). Find it via
+    # GET https://api.hubapi.com/account-info/v3/details (field: portalId).
+    hubspot_portal_id: str = ""
 
     # Slack
     slack_bot_token: str = ""
     slack_signing_secret: str = ""
     slack_alert_channel: str = "#gtm-signals-test"
     slack_owner_user_id: str = ""
+
+    # Clay — outbound last-mile. When an account qualifies we POST it (with the
+    # validated signal summary) to this Clay webhook, which handles contact
+    # discovery + email verification + HubSpot Sequence enrollment. Leave blank
+    # to disable the push (Phase 1 / local runs).
+    clay_webhook_url: str = ""
+    # Outbound is DECOUPLED from Slack alerting and runs on a wider, lower bar:
+    # any account whose cumulative (or single-signal) score clears this pushes
+    # to Clay even if it never fires a Slack alert. Set well below
+    # alert_cumulative_threshold to cast a wider outbound net.
+    clay_push_score_threshold: float = 6.0
+    # Outbound re-touch cadence: once pushed, an account isn't re-pushed for
+    # this many days (don't re-enroll the same contacts every run). Much longer
+    # than the Slack alert cooldown — outbound sequences run for weeks.
+    clay_push_cooldown_days: int = 30
 
     # Inngest
     inngest_app_id: str = "signal-agent"
