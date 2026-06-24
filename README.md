@@ -40,6 +40,10 @@ from it.
    `arthur_signal_summary`, `arthur_last_signal_date` on the company record.
 9. **Traces everything** via OpenTelemetry to the Arthur GenAI Engine
    (prompt, completion, tokens, latency per LLM call + pipeline spans per stage).
+10. **Pushes qualified accounts to Clay** for the outbound last mile — contact
+    discovery (Head of AI / VP Data Science / CISO), email verification, a
+    signal-keyed opener, and HubSpot Sequence enrollment. No-op unless
+    `CLAY_WEBHOOK_URL` is set. See [docs/clay-last-mile.md](docs/clay-last-mile.md).
 
 ## Repo layout
 
@@ -52,6 +56,7 @@ signal_agent/
 
   ingestors/
     base.py               Ingestor ABC + CompanyTarget
+    registry.py           enabled-ingestor list (config-driven via DISABLED_INGESTORS)
     greenhouse.py / lever.py / ashby.py / workday.py    ATS job boards
     news.py                                             Google News RSS per company
     sec_edgar.py                                        SEC filings keyword scan
@@ -68,8 +73,9 @@ signal_agent/
   accounts/resolver.py    HubSpot match / create with fuzzy name fallback
 
   integrations/
-    hubspot.py            property writes + timeline events
+    hubspot.py            property writes + timeline events + record-URL builder
     slack.py              Block Kit rendering + posting + circuit breaker DM
+    clay.py               push qualified accounts to Clay (outbound last mile)
 
   quality/
     suppression.py              operator-managed disqualification patterns
@@ -85,11 +91,12 @@ signal_agent/
   seeds/                  icp_companies.yaml, suppression.yaml, conferences.yaml,
                           competitor_customers_overrides.yaml, loader
 
-migrations/               Alembic schema history
+migrations/               Alembic schema history (latest: 0008 clay-push tracking)
 scripts/                  CLI tools — run_pipeline, flush_digest, import_icp_csv,
                           refresh_competitor_customers, setup_hubspot
-tests/                    pytest — 55 tests, all green
-docs/                     icp.md, arthur-tracing.md, deployment-plan.md, phase1-decisions.md
+tests/                    pytest — 79 tests, all green
+docs/                     icp.md, clay-last-mile.md, arthur-tracing.md,
+                          deployment-plan.md, phase1-decisions.md
 ```
 
 ## Local setup
@@ -104,7 +111,15 @@ python3 -m venv .venv
 
 # 3. Config — copy the template and fill in your keys
 cp .env.example .env
-# Edit .env with Anthropic, HubSpot, Slack, Arthur Engine credentials.
+# Edit .env with credentials:
+#   Anthropic      ANTHROPIC_API_KEY
+#   HubSpot        HUBSPOT_ACCESS_TOKEN, HUBSPOT_PORTAL_ID (for working record URLs)
+#   Slack          SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, SLACK_ALERT_CHANNEL
+#   Clay           CLAY_WEBHOOK_URL (outbound last mile; leave blank to disable)
+#   Arthur Engine  ARTHUR_ENGINE_API_KEY, ARTHUR_TASK_ID (tracing)
+# Note: docker-compose maps Postgres to host port 5433 — DATABASE_URL uses 5433.
+# Optional: DISABLED_INGESTORS=competitive skips the Reddit source, which
+# rate-limits hard across a large account list.
 
 # 4. DB
 .venv/bin/alembic upgrade head
@@ -127,8 +142,11 @@ Inngest Cloud deployment plan.
 ## Bulk-importing ICP accounts
 
 ```bash
-# CSV with a "Company" column; domains resolved via Claude, low-confidence
-# rows flagged for manual review.
+# CSV with a "Company Name" column. A "Domain" column is used directly when
+# present (no LLM call); rows without one are resolved via Claude and
+# low-confidence rows flagged for manual review. Segment + tier are derived
+# from a "Size" (employee-count) column: 5,000+ → A/1, 1,000–4,999 → B/2,
+# <1,000 → C/3.
 .venv/bin/python -m scripts.import_icp_csv /path/to/accounts.csv
 ```
 
@@ -145,16 +163,35 @@ Inngest Cloud deployment plan.
 .venv/bin/python -m scripts.refresh_competitor_customers
 ```
 
+## Outbound last-mile (Clay)
+
+When an account qualifies, the agent POSTs it (company, score/tier, validated
+`signal_summary`, triggering signal, target personas, and a `dedup_key`) to a
+Clay webhook. Clay handles contact discovery, email verification, a signal-keyed
+opener, and HubSpot Sequence enrollment. Full contract, opener prompt, and table
+setup: [docs/clay-last-mile.md](docs/clay-last-mile.md).
+
+The push is **decoupled from Slack alerting** — it runs on its own wider, lower
+bar so more qualified accounts feed outbound without flooding the channel, with
+a separate per-account re-touch cooldown. Tunables:
+
+```bash
+CLAY_WEBHOOK_URL=            # blank disables the push (Phase 1 / local runs)
+CLAY_PUSH_SCORE_THRESHOLD=6  # outbound bar; lower = wider net (alert bar is 12)
+CLAY_PUSH_COOLDOWN_DAYS=30   # don't re-push the same account within N days
+```
+
 ## Tests
 
 ```bash
 .venv/bin/pytest -q
 ```
 
-55 tests cover scoring rubric, alert-decision, digest batching, HTML
-stripping, keyword classifiers, suppression rules, competitor-customer
-matching, and Slack block rendering. Integration tests (HubSpot / Slack /
-Anthropic) are gated by env vars and skipped by default.
+79 tests cover scoring rubric, alert-decision, the Clay-push decision,
+digest batching, HTML stripping, keyword classifiers, suppression rules,
+competitor-customer matching, Slack block rendering, the Clay payload, and
+the HubSpot record-URL builder. Integration tests (HubSpot / Slack /
+Anthropic / Clay) are gated by env vars and skipped by default.
 
 ## Observability
 
@@ -170,6 +207,7 @@ signal_agent.process_signal              (per-signal parent span)
   ├─ signal_agent.llm_validation
   │    └─ anthropic.messages.create      (auto-instrumented)
   ├─ signal_agent.score_and_decide
+  ├─ signal_agent.clay_push                (outbound last mile → httpx → Clay)
   ├─ signal_agent.account_resolution
   │    └─ httpx request → HubSpot        (auto-instrumented)
   ├─ signal_agent.slack_post
@@ -199,6 +237,14 @@ or decision type.
 - **Source of truth is docs/icp.md.** All tunables (keywords, weights,
   competitor list, LLM prompt) reference it. When the ICP changes, the
   doc changes first, then the code follows.
+- **Outbound is decoupled from awareness.** The Clay push runs on a lower,
+  wider bar than Slack alerting (and its own cooldown), so the awareness
+  channel stays high-signal while outbound still gets a broad net. An account
+  can be pushed to Clay without ever firing a Slack alert.
+- **Regulatory framing is dated, not assumed.** Per the April 17, 2026
+  interagency MRM rewrite (OCC 2026-13), GenAI/agentic systems are out of
+  SR 11-7 scope. The validator + messaging frame them under fair lending,
+  NYDFS, FFIEC, SEC, and state laws instead; SR 11-7 stays a detection keyword.
 
 ## Status
 
@@ -206,7 +252,9 @@ or decision type.
 - Phase 2 (news + SEC) — done
 - Phase 3 (HN, Reddit, conferences, Workday, LinkedIn scaffold, digest) — done
 - Arthur tracing — done, exporting to https://engine.development.arthur.ai
-- ICP list — 361 active companies imported from the target-account CSV
+- Outbound last-mile (Clay push, decoupled bar, contact enrichment) — done
+- ICP list — seed ships 8 companies; bulk-load the full target list via
+  `scripts.import_icp_csv` (see Bulk-importing ICP accounts)
 
 ## Deploy
 

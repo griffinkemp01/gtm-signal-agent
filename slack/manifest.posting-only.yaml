@@ -1,0 +1,47 @@
+# Slack App Manifest — Arthur Signal Agent (POSTING-ONLY variant)
+#
+# Same as manifest.yaml but with interactivity DISABLED, so there's no public
+# tunnel / request_url to configure. Use this to get alert posting working now;
+# switch to manifest.yaml (+ ngrok) later if you want Claim/Snooze buttons.
+#
+# Create the app at: https://api.slack.com/apps → "Create New App" → "From a manifest"
+# Paste this YAML, pick your workspace, review permissions, install to workspace.
+#
+# After install:
+#   1. Copy the Bot User OAuth Token (xoxb-...)        → SLACK_BOT_TOKEN in .env
+#   2. Invite the bot to your alert channel:            /invite @arthur-signal-agent
+
+display_information:
+  name: Arthur Signal Agent
+  description: Surfaces AI governance buying signals to AEs in Slack.
+  background_color: "#1f2d3d"
+  long_description: >
+    Monitors public web signals (job postings, news, SEC filings, LinkedIn hires)
+    for enterprises scaling AI/ML agent deployments. Posts scored alerts to
+    #gtm-signals with Claim and Snooze actions, and writes structured data back
+    to HubSpot for pipeline reporting.
+
+features:
+  bot_user:
+    display_name: arthur-signal-agent
+    always_online: true
+
+oauth_config:
+  scopes:
+    bot:
+      # Post alerts to the configured channel + thread acknowledgments.
+      - chat:write
+      # Post to channels the bot hasn't been explicitly invited to.
+      - chat:write.public
+      # DM the SLACK_OWNER_USER_ID when the circuit breaker trips.
+      - im:write
+      # Read basic channel metadata for error messages.
+      - channels:read
+      # Resolve user id → handle for thread acknowledgments.
+      - users:read
+
+settings:
+  # Interactivity disabled in this variant — no public request_url needed.
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

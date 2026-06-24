@@ -16,7 +16,7 @@ stare at this during the weekly review cycle).
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import inngest
 import structlog
@@ -24,7 +24,8 @@ import structlog
 from signal_agent.accounts.resolver import AccountResolver
 from signal_agent.config import settings
 from signal_agent.db import session_scope
-from signal_agent.integrations.hubspot import HubSpotClient
+from signal_agent.integrations.clay import ClayAccountPayload, ClayPusher
+from signal_agent.integrations.hubspot import HubSpotClient, company_record_url
 from signal_agent.integrations.slack import AlertContext, SlackAlerter
 from signal_agent.models import Alert, Company, Signal, SignalStatus
 from signal_agent.quality import circuit_breaker, competitor_customers, digest, suppression
@@ -135,8 +136,54 @@ async def process_signal(ctx: inngest.Context) -> dict:
             }
 
     scored = await ctx.step.run("score", _score_step)
+
+    # ---- step 3b: outbound last-mile (DECOUPLED from Slack alerting) ---------
+    # Pushes the account to Clay on a wider, lower bar (CLAY_PUSH_SCORE_THRESHOLD)
+    # with its own cooldown, so qualified-but-not-alert-worthy accounts still
+    # feed contact discovery + sequencing. Runs for every scored account,
+    # regardless of the Slack alert decision. No-op when CLAY_WEBHOOK_URL unset.
+    def _clay_push_step() -> dict:
+        with session_scope() as s:
+            sig = s.get(Signal, signal_id)
+            rollup = scorer.cumulative_company_score(s, sig.company_id)
+            decision = scorer.should_push_to_clay(rollup, sig, sig.company)
+            if not decision.should_push:
+                return {"pushed": False, "reason": decision.reason}
+            recent = (
+                s.query(Signal)
+                .filter(Signal.id.in_(rollup.contributing_signal_ids))
+                .order_by(Signal.detected_at.desc())
+                .limit(3)
+                .all()
+            )
+            top_signals = [
+                {"type": r.signal_type, "url": r.source_url,
+                 "text": r.signal_text.split("\n", 1)[0][:120]}
+                for r in recent
+            ]
+            pushed = ClayPusher().push(ClayAccountPayload(
+                company_name=sig.company.name,
+                company_domain=sig.company.domain,
+                hubspot_id=sig.company.hubspot_id,
+                target_tier=sig.company.target_tier,
+                segment=sig.company.segment,
+                cumulative_score=rollup.cumulative_score,
+                tier=rollup.top_tier,
+                signal_summary=sig.llm_summary or "",
+                triggering_signal={"type": sig.signal_type, "url": sig.source_url,
+                                   "text": sig.signal_text.split("\n", 1)[0][:120]},
+                top_signals=top_signals,
+                qualification_reason=decision.reason,
+                also_alerted=scored["alert_needed"],
+            ))
+            if pushed:
+                scorer.mark_clay_pushed(sig.company, rollup.cumulative_score)
+            return {"pushed": pushed, "reason": decision.reason}
+
+    clay_res = await ctx.step.run("clay_push", _clay_push_step)
+
     if not scored["alert_needed"]:
-        return scored
+        return {**scored, "clay": clay_res}
 
     # ---- step 4: account resolution -----------------------------------------
     def _resolve_step() -> dict:
@@ -168,7 +215,7 @@ async def process_signal(ctx: inngest.Context) -> dict:
             company: Company = sig.company
 
             # Respect manual snoozes.
-            if company.snoozed_until and company.snoozed_until > datetime.now(timezone.utc):
+            if company.snoozed_until and company.snoozed_until > datetime.now(UTC):
                 return {"alert_skipped": "snoozed", "until": company.snoozed_until.isoformat()}
 
             # Persist alert row first so the Slack button can reference alert_id.
@@ -182,13 +229,8 @@ async def process_signal(ctx: inngest.Context) -> dict:
             s.add(alert)
             s.flush()
 
-            # Digest-mode gating — non-Tier-1 alerts during a burst go to the
-            # pending queue; flush_digest posts them as a grouped message.
-            if digest.should_batch(s, sig.tier):
-                digest.enqueue(s, alert)
-                return {"alert_id": alert.id, "outcome": "queued_for_digest"}
-
-            # Gather the top 3 most recent contributing signals for context.
+            # Gather the top 3 most recent contributing signals for the Slack
+            # alert. (The Clay push is decoupled — handled in step 3b above.)
             recent = (
                 s.query(Signal)
                 .filter(Signal.id.in_(scored["contributing"]))
@@ -202,10 +244,13 @@ async def process_signal(ctx: inngest.Context) -> dict:
                 for r in recent
             ]
 
-            hubspot_url = (
-                f"https://app.hubspot.com/contacts/_/company/{company.hubspot_id}"
-                if company.hubspot_id else None
-            )
+            # Digest-mode gating — non-Tier-1 alerts during a burst go to the
+            # pending queue; flush_digest posts them as a grouped message.
+            if digest.should_batch(s, sig.tier):
+                digest.enqueue(s, alert)
+                return {"alert_id": alert.id, "outcome": "queued_for_digest"}
+
+            hubspot_url = company_record_url(company.hubspot_id)
 
             ctx_obj = AlertContext(
                 company_name=company.name,
@@ -232,7 +277,7 @@ async def process_signal(ctx: inngest.Context) -> dict:
                     score=scored["cumulative"],
                     tier=scored["top_tier"],
                     summary=sig.llm_summary or "",
-                    last_signal_date_iso=sig.detected_at.astimezone(timezone.utc).isoformat(),
+                    last_signal_date_iso=sig.detected_at.astimezone(UTC).isoformat(),
                 )
                 hs.emit_timeline_event(
                     hubspot_company_id=company.hubspot_id,

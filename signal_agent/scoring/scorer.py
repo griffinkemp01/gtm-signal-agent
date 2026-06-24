@@ -253,3 +253,60 @@ def mark_alerted(company: Company, cumulative_score: float,
     """Update cooldown state after an alert fires. Call from within a session."""
     company.last_alerted_at = now or datetime.now(timezone.utc)
     company.last_alerted_score = cumulative_score
+
+
+# ---- Clay outbound push decision -------------------------------------------
+#
+# DECOUPLED from Slack alerting. The Slack alert bar is deliberately strict so
+# the awareness channel stays high-signal. Outbound wants a WIDER net — more
+# accounts into contact discovery + sequencing — so it runs on its own, lower
+# threshold (CLAY_PUSH_SCORE_THRESHOLD) and its own (longer) cooldown
+# (CLAY_PUSH_COOLDOWN_DAYS). An account can be pushed to Clay without ever
+# firing a Slack alert, and vice-versa.
+
+
+@dataclass
+class ClayPushDecision:
+    """Why we did or didn't push an account to the Clay outbound last-mile."""
+    should_push: bool
+    reason: str   # "first_push" | "cooldown_expired" | "in_cooldown" | "below_clay_threshold"
+
+
+def should_push_to_clay(
+    rollup: CompanyScoreRollup,
+    triggering: Signal,
+    company: Company,
+    now: datetime | None = None,
+) -> ClayPushDecision:
+    """Decide whether to push this (already-validated) account to Clay.
+
+    Wider + simpler than `should_alert`: there's no URL/same-type dedup (Clay
+    enrolls at the *account* level, not per-article), just a score floor and an
+    account-level re-touch cooldown. Always-alert signal types push regardless
+    of score — if it's worth alerting Slack, it's worth an outbound touch.
+    """
+    now = now or datetime.now(timezone.utc)
+
+    above_bar = (
+        triggering.signal_type in ALWAYS_ALERT_SIGNAL_TYPES
+        or rollup.cumulative_score >= settings.clay_push_score_threshold
+        or triggering.raw_score >= settings.clay_push_score_threshold
+    )
+    if not above_bar:
+        return ClayPushDecision(should_push=False, reason="below_clay_threshold")
+
+    if company.last_clay_pushed_at is not None:
+        cooldown = timedelta(days=settings.clay_push_cooldown_days)
+        if (now - company.last_clay_pushed_at) < cooldown:
+            return ClayPushDecision(should_push=False, reason="in_cooldown")
+        return ClayPushDecision(should_push=True, reason="cooldown_expired")
+
+    return ClayPushDecision(should_push=True, reason="first_push")
+
+
+def mark_clay_pushed(company: Company, cumulative_score: float,
+                     now: datetime | None = None) -> None:
+    """Record the Clay-push cooldown state. Call from within a session after a
+    successful push."""
+    company.last_clay_pushed_at = now or datetime.now(timezone.utc)
+    company.last_clay_pushed_score = cumulative_score
