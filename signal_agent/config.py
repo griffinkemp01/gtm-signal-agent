@@ -10,7 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Load .env BEFORE pydantic-settings reads its defaults. override=True makes the
@@ -30,6 +30,16 @@ class Settings(BaseSettings):
     database_url: str = Field(default="postgresql+psycopg://signal:signal@localhost:5432/signal_agent")
     log_level: str = "INFO"
     env: str = "dev"
+
+    @field_validator("database_url")
+    @classmethod
+    def _force_psycopg_driver(cls, v: str) -> str:
+        # Managed Postgres (Render, etc.) hands out URLs as `postgresql://…`,
+        # which makes SQLAlchemy default to psycopg2 — not installed; we use
+        # psycopg v3. Rewrite the scheme so one URL works locally and in prod.
+        if v.startswith("postgresql://"):
+            return v.replace("postgresql://", "postgresql+psycopg://", 1)
+        return v
 
     # Ingestion — comma-separated ingestor `source` names to SKIP (e.g.
     # "competitive,conference"). Useful to drop sources that rate-limit or add
