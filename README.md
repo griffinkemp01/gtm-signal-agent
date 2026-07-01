@@ -91,10 +91,10 @@ signal_agent/
   seeds/                  icp_companies.yaml, suppression.yaml, conferences.yaml,
                           competitor_customers_overrides.yaml, loader
 
-migrations/               Alembic schema history (latest: 0008 clay-push tracking)
+migrations/               Alembic schema history (latest: 0009 signal dedup_key)
 scripts/                  CLI tools — run_pipeline, flush_digest, import_icp_csv,
                           refresh_competitor_customers, setup_hubspot
-tests/                    pytest — 79 tests, all green
+tests/                    pytest — 85 tests, all green
 docs/                     icp.md, clay-last-mile.md, arthur-tracing.md,
                           deployment-plan.md, phase1-decisions.md
 ```
@@ -187,7 +187,7 @@ CLAY_PUSH_COOLDOWN_DAYS=30   # don't re-push the same account within N days
 .venv/bin/pytest -q
 ```
 
-79 tests cover scoring rubric, alert-decision, the Clay-push decision,
+85 tests cover scoring rubric, alert-decision, the Clay-push decision,
 digest batching, HTML stripping, keyword classifiers, suppression rules,
 competitor-customer matching, Slack block rendering, the Clay payload, and
 the HubSpot record-URL builder. Integration tests (HubSpot / Slack /
@@ -228,6 +228,14 @@ or decision type.
   a Tier-1 signal fires, or the score jumps by ≥50%. Prevents flooding.
 - **Tier multiplier on scoring.** Same signal at a Segment A account
   (tier 1) scores 1.25× what it does at a Segment C account (tier 3).
+- **Per-signal-type score cap.** One newsworthy event can spawn 40+
+  near-identical articles; cumulative scoring counts at most
+  `SCORE_MAX_SIGNALS_PER_TYPE` (default 3) of each signal_type per company so a
+  single event can't dominate the score.
+- **Dedup on a stable key, not source_url.** Signals dedupe on
+  `(company, signal_type, dedup_key)`. News keys on a title+date hash because
+  its Google-redirect URL changes every fetch; stable-URL sources key on the
+  URL. Prevents the same story re-inserting as a new row each run.
 - **Competitor-customer check before LLM spend.** Accounts already on
   an Arthur competitor's public customer page are suppressed at ingest —
   we don't waste LLM dollars or channel attention on them.

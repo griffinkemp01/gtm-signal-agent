@@ -107,6 +107,18 @@ def _split_title(title: str) -> tuple[str, str]:
     return title.strip(), ""
 
 
+def news_dedup_key(title: str, pub_date: datetime) -> str:
+    """Stable dedup identity for a news item.
+
+    Keys on headline + publish date, NOT the Google News link — the link is a
+    redirect token that changes every fetch, so keying on it re-inserts the same
+    story as a new row on each run and inflates cumulative scores. Namespaced
+    with a `news:` prefix so it can't collide with a URL-based dedup_key.
+    """
+    h = hashlib.sha1(f"{title}|{pub_date.isoformat()}".encode()).hexdigest()[:16]
+    return f"news:{h}"
+
+
 class NewsIngestor(Ingestor):
     source = "news"
 
@@ -182,15 +194,16 @@ class NewsIngestor(Ingestor):
                 continue
             signal_type, matched = classification
 
-            # Dedup key for news: hash of title+pub_date (links change over time).
-            dedup = hashlib.sha1(f"{title}|{pub_date.isoformat()}".encode()).hexdigest()[:16]
+            # Stable dedup key from title+pub_date — the link changes each fetch.
+            dedup = news_dedup_key(title, pub_date)
 
             yield NormalizedSignal(
                 company_domain=target.domain,
                 company_name=target.name,
                 signal_type=signal_type,
                 source=self.source,
-                source_url=link or f"news://{dedup}",
+                source_url=link or dedup,
+                dedup_key=dedup,
                 signal_text=f"{title}\n\n{description[:400]}",
                 raw_payload={
                     "title": title,

@@ -81,8 +81,31 @@ def update_signal_score(session: Session, signal: Signal) -> None:
     signal.tier = SignalTier(tier_for_score(score))
 
 
+def _cap_and_sum(rows, cap: int) -> tuple[float, list[int]]:
+    """Sum raw_score keeping at most `cap` highest-scoring signals per signal_type.
+
+    Pure helper (no DB) so the cap logic is unit-testable. Returns
+    (total, contributing_signal_ids). One newsworthy event can spawn dozens of
+    near-identical articles of the same signal_type; without the cap they sum
+    linearly and swamp the score. `cap <= 0` disables the cap (sum everything).
+    """
+    from collections import defaultdict
+    by_type: dict[str, list] = defaultdict(list)
+    for r in rows:
+        by_type[r.signal_type].append(r)
+    total = 0.0
+    contributing: list[int] = []
+    for group in by_type.values():
+        group = sorted(group, key=lambda r: r.raw_score, reverse=True)
+        kept = group if cap <= 0 else group[:cap]
+        total += sum(r.raw_score for r in kept)
+        contributing.extend(r.id for r in kept)
+    return round(total, 2), contributing
+
+
 def cumulative_company_score(session: Session, company_id: int) -> CompanyScoreRollup:
-    """Sum all validated signals for the company within the lookback window."""
+    """Cumulative score for the company over the window, capping per signal_type
+    so a single high-volume news event can't dominate (see _cap_and_sum)."""
     window_start = datetime.now(timezone.utc) - timedelta(days=settings.alert_cumulative_window_days)
     rows = session.execute(
         select(Signal).where(
@@ -101,14 +124,16 @@ def cumulative_company_score(session: Session, company_id: int) -> CompanyScoreR
             contributing_signal_ids=[],
         )
 
-    total = round(sum(r.raw_score for r in rows), 2)
-    top_tier = min(r.tier.value for r in rows if r.tier is not None)  # tier_1 < tier_2 < tier_3 lex
+    total, contributing = _cap_and_sum(rows, settings.score_max_signals_per_type)
+    # top_tier reflects the strongest signal the company has, independent of the
+    # score cap (tier_1 < tier_2 < tier_3 lexically).
+    top_tier = min(r.tier.value for r in rows if r.tier is not None)
     return CompanyScoreRollup(
         company_id=company_id,
         cumulative_score=total,
         top_tier=top_tier,
         window_days=settings.alert_cumulative_window_days,
-        contributing_signal_ids=[r.id for r in rows],
+        contributing_signal_ids=contributing,
     )
 
 

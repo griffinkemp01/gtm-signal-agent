@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     inngest_dev: bool = True
 
     # Scoring
+    # Cap how many signals of the SAME signal_type contribute to a company's
+    # cumulative score within the window. Stops one newsworthy event (which can
+    # spawn 40+ near-identical articles) from dominating the score — we count
+    # the top-N highest-scoring items of each type and ignore the long tail.
+    score_max_signals_per_type: int = 3
     alert_score_threshold: int = 8
     alert_cumulative_threshold: int = 12
     alert_cumulative_window_days: int = 60
