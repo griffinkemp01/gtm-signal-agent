@@ -80,6 +80,7 @@ async def ingest_company(target: CompanyTarget) -> list[int]:
                     signal_type=norm.signal_type,
                     source=norm.source,
                     source_url=norm.source_url,
+                    dedup_key=norm.dedup_key or norm.source_url,
                     signal_text=norm.signal_text,
                     raw_payload=norm.raw_payload,
                     status=SignalStatus.PENDING.value,

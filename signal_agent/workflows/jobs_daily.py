@@ -113,13 +113,14 @@ async def ingest_jobs_for_company(ctx: inngest.Context) -> dict:
                 log.warning("ingest.source_failed", err=str(res))
                 continue
             for norm in res:
-                # Upsert by (company_id, signal_type, source_url). On conflict,
+                # Upsert by (company_id, signal_type, dedup_key). On conflict,
                 # bump last_seen_at but don't re-run validation.
                 stmt = pg_insert(Signal).values(
                     company_id=target.company_id,
                     signal_type=norm.signal_type,
                     source=norm.source,
                     source_url=norm.source_url,
+                    dedup_key=norm.dedup_key or norm.source_url,
                     signal_text=norm.signal_text,
                     raw_payload=norm.raw_payload,
                     status=SignalStatus.PENDING.value,  # pg_insert bypasses ORM coercion

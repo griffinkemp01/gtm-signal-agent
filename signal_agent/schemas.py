@@ -27,6 +27,13 @@ class NormalizedSignal(BaseModel):
     suggested_tier_hint: int | None = None
     matched_keywords: list[str] = Field(default_factory=list)
 
+    # Stable dedup identity for the (company, signal_type, dedup_key) uniqueness
+    # constraint. Defaults to source_url at insert time when None — fine for ATS
+    # / SEC where the URL is stable. News sets this explicitly to a title+date
+    # hash because its Google-redirect source_url changes on every fetch, which
+    # otherwise re-inserts the same story as a new row each run.
+    dedup_key: str | None = None
+
 
 class ValidationResult(BaseModel):
     is_valid: bool

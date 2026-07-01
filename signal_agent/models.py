@@ -88,15 +88,21 @@ class Company(Base):
 
 class Signal(Base):
     __tablename__ = "signals"
+    # Dedup on a STABLE key, not source_url — news source_urls (Google redirect
+    # links) change every fetch, which re-inserted the same story as a new row
+    # each run and inflated cumulative scores. See dedup_key below.
     __table_args__ = (
-        UniqueConstraint("company_id", "signal_type", "source_url", name="uq_signal_dedup"),
+        UniqueConstraint("company_id", "signal_type", "dedup_key", name="uq_signal_dedup"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
     signal_type: Mapped[str] = mapped_column(String(64), index=True)   # e.g. "job_posting.ai_governance"
     source: Mapped[str] = mapped_column(String(32))                    # "greenhouse" | "lever" | ...
-    source_url: Mapped[str] = mapped_column(String(1024))
+    source_url: Mapped[str] = mapped_column(String(1024))              # human-clickable link (may change)
+    # Stable dedup identity: source_url for stable-URL sources (ATS/SEC), a
+    # title+date hash for news. Populated at ingest (defaults to source_url).
+    dedup_key: Mapped[str] = mapped_column(String(1024))
     signal_text: Mapped[str] = mapped_column(Text)                     # job title + key excerpt
     raw_payload: Mapped[dict] = mapped_column(JSON)
 

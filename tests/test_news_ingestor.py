@@ -1,4 +1,20 @@
-from signal_agent.ingestors.news import _classify_news, _split_title
+from datetime import datetime, timezone
+
+from signal_agent.ingestors.news import _classify_news, _split_title, news_dedup_key
+
+
+def test_news_dedup_key_is_stable_and_link_independent():
+    d = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    # Same headline + date => same key regardless of the (volatile) Google link.
+    assert news_dedup_key("Acme names Chief AI Officer", d) == news_dedup_key(
+        "Acme names Chief AI Officer", d
+    )
+    assert news_dedup_key("Acme names Chief AI Officer", d).startswith("news:")
+
+
+def test_news_dedup_key_differs_by_headline():
+    d = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    assert news_dedup_key("Story A", d) != news_dedup_key("Story B", d)
 
 
 def test_split_title_with_publication():
